@@ -1,6 +1,6 @@
 {
   "name": "savelocker-decky",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sets the Steam launch options SaveLocker needs, which the agent cannot set itself.",
   "type": "module",
   "scripts": {
@@ -22,7 +22,10 @@
   },
   "pnpm": {
     "peerDependencyRules": {
-      "ignoreMissing": ["react", "react-dom"]
+      "ignoreMissing": [
+        "react",
+        "react-dom"
+      ]
     }
   }
 }
