@@ -53,12 +53,37 @@ npm run build      # -> dist/index.js
 
 ## Install on a Deck
 
-Decky loads plugins from `~/homebrew/plugins/<name>/`. Copy `plugin.json`, `main.py` and `dist/`:
+Decky loads plugins from `~/homebrew/plugins/<name>/`, which is **root-owned**, so the copy needs
+`sudo` on the Deck itself. Four things must be there: `plugin.json`, **`package.json`**, `main.py`
+and `dist/`.
 
 ```sh
-ssh deck@<deck-ip> mkdir -p ~/homebrew/plugins/SaveLocker
-scp -r plugin.json main.py dist deck@<deck-ip>:~/homebrew/plugins/SaveLocker/
+# from your dev machine
+scp -r plugin.json package.json main.py dist deck@<deck-ip>:~/savelocker-plugin-stage/
+# then, on the Deck
+sudo cp -r ~/savelocker-plugin-stage /home/deck/homebrew/plugins/SaveLocker
+sudo chown -R root:root /home/deck/homebrew/plugins/SaveLocker
+sudo systemctl restart plugin_loader
 ```
 
-Then restart Decky (or the Steam client). Developer mode with **CEF remote debugging** enabled is
-what makes the frontend's console reachable while iterating.
+**`package.json` is not optional, and leaving it out fails in a way that points at the wrong thing.**
+Decky chooses how to load a plugin from it: with `"type": "module"` it uses `import()`
+(`ESMODULE_V1`), and without a `package.json` at all it falls back to `LEGACY_EVAL_IIFE`, which
+`eval`s the bundle as a classic script. The ESM bundle then dies on its own last line with
+`SyntaxError: Unexpected token 'export'` — inside Decky's loader, with no mention of a missing file.
+The tell is `version: null` for the plugin in `DeckyPluginLoader.plugins`, since that field also
+comes from `package.json`.
+
+## Debugging it
+
+The backend logs to `~/homebrew/logs/SaveLocker/*.log` on the Deck, readable over SSH. The
+**frontend** logs nowhere on disk — it runs in Steam's `SharedJSContext`, so errors are only in CEF.
+Reach it without touching the Deck's screen:
+
+```sh
+ssh -N -L 8080:127.0.0.1:8080 deck@<deck-ip>     # CEF is loopback-only on the Deck
+curl -s http://localhost:8080/json               # find the SharedJSContext / QuickAccess targets
+```
+
+Then drive CDP over the websocket: `Runtime.evaluate` with `document.body.innerText` on the
+QuickAccess target prints whatever the panel is showing, error boundary included.

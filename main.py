@@ -8,9 +8,11 @@ machine at another server. The plugin's frontend runs on https://steamloopback.h
 foreign origin and cannot call the agent at all. That is the defence working, not an obstacle to
 route around: do not ask for a CORS exemption.
 
-The plugin is READ-ONLY against the agent's state directory. Decky runs plugin backends as root, and
-a root-created file under ~/.local/share/SaveLocker would break the agent the next time it rewrote
-it as the desktop user. We read the token; we never write anything there.
+This plugin does NOT ask for the `_root` flag, and must not. Everything it needs is the desktop
+user's own: the api-token file is mode 0600 owned by that user, and the agent's API is loopback. A
+root backend would gain nothing and cost plenty — Decky would run this code as root, and a
+root-created file under ~/.local/share/SaveLocker would break the agent the next time it rewrote
+that file as the desktop user. Read the token; write nothing there.
 """
 
 import json

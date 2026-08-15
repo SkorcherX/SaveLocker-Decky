@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ButtonItem, PanelSection, PanelSectionRow, ToggleField, staticClasses } from '@decky/ui'
+import { ButtonItem, Focusable, PanelSection, PanelSectionRow, ToggleField, staticClasses } from '@decky/ui'
 import { callable, definePlugin, toaster } from '@decky/api'
 import { FaGamepad } from 'react-icons/fa'
 
@@ -141,6 +141,23 @@ async function applyAll(write: boolean): Promise<{ outcomes: Outcome[]; problem?
   return { outcomes }
 }
 
+const shortState = (o: Outcome) =>
+  o.state === 'written' ? 'set'
+    : o.state === 'already-correct' ? 'ok'
+      : o.state === 'would-write' ? 'would change'
+        : 'failed'
+
+/** One line the user can read at a glance, so the list below is detail rather than the answer. */
+function summarise(outcomes: Outcome[]): string {
+  const n = (s: Outcome['state']) => outcomes.filter((o) => o.state === s).length
+  const parts = [`${outcomes.length} game${outcomes.length === 1 ? '' : 's'}`]
+  if (n('already-correct')) parts.push(`${n('already-correct')} already set`)
+  if (n('would-write')) parts.push(`${n('would-write')} would change`)
+  if (n('written')) parts.push(`${n('written')} set`)
+  if (n('failed')) parts.push(`${n('failed')} failed`)
+  return parts.join(' · ')
+}
+
 function Content() {
   const [outcomes, setOutcomes] = useState<Outcome[]>([])
   const [problem, setProblem] = useState<string | undefined>()
@@ -211,24 +228,49 @@ function Content() {
         <PanelSectionRow>No tracked game launches through Steam.</PanelSectionRow>
       )}
 
-      {/* Everything it did, always visible, including what it READ. A plugin that edits Steam
-          settings without showing what it changed is one nobody should trust — and on a first run
-          the current value is the whole diagnostic: if it comes back empty for a game you know has
-          options, this is reading the wrong field and must not be allowed to write. */}
-      {outcomes.map((o) => (
-        <PanelSectionRow key={o.name}>
-          <div style={{ fontSize: '0.8em', wordBreak: 'break-all' }}>
-            <div><b>{o.name}</b> — {
-              o.state === 'written' ? 'set'
-                : o.state === 'already-correct' ? 'already set'
-                  : o.state === 'would-write' ? 'would change (not written)'
-                    : `failed — ${o.detail}`
-            }</div>
-            <div>now: {o.current === '' ? '(empty)' : o.current}</div>
-            {o.state !== 'already-correct' && <div>target: {o.target}</div>}
-          </div>
+      {outcomes.length > 0 && (
+        <PanelSectionRow>
+          <div style={{ fontSize: '0.85em', opacity: 0.8 }}>{summarise(outcomes)}</div>
         </PanelSectionRow>
-      ))}
+      )}
+
+      {/* Every row is Focusable, and that is load-bearing rather than decorative: Steam's Quick
+          Access panel only scrolls to things the D-pad can reach, so a list of plain <div>s is
+          simply unreachable past the fold — with four games it already overflowed with no way to
+          scroll. Focusable rows also give each game a selection ring, which is how a gamepad user
+          reads a list at all.
+
+          Only rows that need attention print their strings. A run where everything is already
+          correct is the common case and should be four short lines, not four paragraphs. */}
+      <PanelSectionRow>
+        <Focusable style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+          {outcomes.map((o) => (
+            <Focusable
+              key={o.name}
+              style={{ padding: '4px 6px', borderRadius: '4px', fontSize: '0.8em' }}
+              focusWithinClassName="gpfocuswithin"
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {o.name}
+                </span>
+                <span style={{ flexShrink: 0, opacity: 0.75 }}>{shortState(o)}</span>
+              </div>
+
+              {/* The current value is the whole diagnostic on a first run: a game known to carry
+                  mangohud that reads back "(empty)" proves the wrong field is being read, and that
+                  it must not be allowed to write. */}
+              {o.state !== 'already-correct' && (
+                <div style={{ opacity: 0.7, wordBreak: 'break-all', marginTop: '2px' }}>
+                  <div>now: {o.current === '' ? '(empty)' : o.current}</div>
+                  <div>target: {o.target}</div>
+                  {o.detail && <div>error: {o.detail}</div>}
+                </div>
+              )}
+            </Focusable>
+          ))}
+        </Focusable>
+      </PanelSectionRow>
     </PanelSection>
   )
 }

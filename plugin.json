@@ -1,7 +1,7 @@
 {
   "name": "SaveLocker",
   "author": "SkorcherX",
-  "flags": ["_root"],
+  "flags": [],
   "api_version": 1,
   "publish": {
     "tags": ["saves", "sync", "utility"],
