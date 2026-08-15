@@ -32,12 +32,43 @@ interface Resolved {
   changed: boolean
 }
 
+interface LeaseWarning {
+  gameName: string
+  holderMachine: string
+}
+
+interface AgentState {
+  connected: boolean
+  currentVersion: string
+  machineName: string
+  serverUrl: string
+  gamesTracked: number
+  savesBacked: number
+  lastSyncAgo: string
+  leaseWarnings: LeaseWarning[]
+}
+
+interface AgentVersion {
+  currentVersion: string
+  latestVersion: string | null
+  updateAvailable: boolean
+}
+
+interface DoctorResult {
+  exitCode: number
+  output: string
+}
+
 type AgentResult<T> = { ok: true; data: T } | { ok: false; reason: string }
 
 const fetchRows = callable<[], AgentResult<Row[]>>('rows')
 const resolveOptions =
   callable<[{ steamAppId: number; current: string }[]], AgentResult<Resolved[]>>('resolve')
 const report = callable<[number, boolean, string | null], AgentResult<null>>('report')
+const fetchState = callable<[], AgentResult<AgentState>>('state')
+const fetchVersion = callable<[], AgentResult<AgentVersion>>('agent_version')
+const dismissWarning = callable<[string], AgentResult<null>>('dismiss_warning')
+const runDoctor = callable<[], AgentResult<DoctorResult>>('doctor')
 
 /**
  * A game's launch options as Steam holds them right now.
@@ -158,6 +189,127 @@ function summarise(outcomes: Outcome[]): string {
   return parts.join(' · ')
 }
 
+/**
+ * "Your other machine has this game checked out."
+ *
+ * This is the highest-value thing in the panel and the reason the status surface exists at all. The
+ * agent records lease warnings durably on disk precisely so they survive to *some* UI, but until now
+ * that UI was the agent's web UI or the server console — neither of which anyone is looking at while
+ * holding a Deck about to press play. Here it reaches the user at the only moment it can act on.
+ */
+function LeaseWarnings({ warnings, onDismiss }: {
+  warnings: LeaseWarning[]
+  onDismiss: (gameName: string) => void
+}) {
+  if (warnings.length === 0) return null
+  return (
+    <PanelSection title="Checked out elsewhere">
+      {warnings.map((w) => (
+        <PanelSectionRow key={w.gameName}>
+          <Focusable style={{ padding: '4px 6px', fontSize: '0.85em' }}>
+            <div><b>{w.gameName}</b></div>
+            <div style={{ opacity: 0.75 }}>
+              open on {w.holderMachine}. Playing here may cause a conflict.
+            </div>
+          </Focusable>
+        </PanelSectionRow>
+      ))}
+      {warnings.map((w) => (
+        <PanelSectionRow key={`dismiss-${w.gameName}`}>
+          {/* Dismiss clears the notice, not the condition — if the lease is still held the agent
+              records it again. That is right: the warning exists to be seen before launching. */}
+          <ButtonItem layout="below" onClick={() => onDismiss(w.gameName)}>
+            Dismiss {w.gameName}
+          </ButtonItem>
+        </PanelSectionRow>
+      ))}
+    </PanelSection>
+  )
+}
+
+function Status({ state, version }: { state: AgentState | null; version: AgentVersion | null }) {
+  if (!state) return null
+  const line = (label: string, value: string) => (
+    <PanelSectionRow>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', gap: '8px' }}>
+        <span style={{ opacity: 0.7 }}>{label}</span>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
+      </div>
+    </PanelSectionRow>
+  )
+  return (
+    <PanelSection title="Status">
+      {line('Server', state.connected ? state.machineName : 'not connected')}
+      {line('Last sync', state.lastSyncAgo)}
+      {line('Games', String(state.gamesTracked))}
+      {line('Saves pushed', String(state.savesBacked))}
+      {/* The agent already stages its own update and applies it at next start; this is the only
+          place on a Deck in Game Mode that says so before the reboot happens. */}
+      {version?.updateAvailable
+        ? line('Agent', `${version.currentVersion} → ${version.latestVersion} ready`)
+        : line('Agent', state.currentVersion)}
+    </PanelSection>
+  )
+}
+
+/**
+ * `savelocker doctor`, on demand.
+ *
+ * Doctor is the only diagnostic a Deck has, and reaching it otherwise means Desktop Mode and a
+ * terminal. On-demand only: it makes network calls and takes seconds, so it must never sit on a
+ * timer behind a panel the user opened for something else.
+ */
+function Diagnostics() {
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<DoctorResult | null>(null)
+  const [problem, setProblem] = useState<string | null>(null)
+
+  const run = async () => {
+    setBusy(true)
+    setProblem(null)
+    try {
+      const r = await runDoctor()
+      if (r.ok) setResult(r.data)
+      else { setResult(null); setProblem(r.reason) }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <PanelSection title="Diagnostics">
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy} onClick={() => void run()}>
+          {busy ? 'Running doctor…' : 'Run doctor'}
+        </ButtonItem>
+      </PanelSectionRow>
+      {problem && (
+        <PanelSectionRow>
+          {problem === 'no-agent' ? 'SaveLocker is not installed on this device.'
+            : problem === 'timeout' ? 'doctor did not finish within 60 seconds.'
+              : `Could not run doctor (${problem}).`}
+        </PanelSectionRow>
+      )}
+      {result && (
+        <PanelSectionRow>
+          <Focusable style={{ display: 'flex', flexDirection: 'column' }}>
+            <div style={{ fontSize: '0.8em', opacity: 0.75, marginBottom: '4px' }}>
+              {result.exitCode === 0 ? 'No problems found.' : `Exited ${result.exitCode} — see below.`}
+            </div>
+            {/* Every line focusable, or the D-pad cannot reach past the fold and doctor's output is
+                far longer than one screen. */}
+            {result.output.split('\n').filter((l) => l.trim() !== '').map((l, i) => (
+              <Focusable key={i} style={{ fontSize: '0.72em', whiteSpace: 'pre-wrap', wordBreak: 'break-all', padding: '1px 4px' }}>
+                {l}
+              </Focusable>
+            ))}
+          </Focusable>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
+  )
+}
+
 function Content() {
   const [outcomes, setOutcomes] = useState<Outcome[]>([])
   const [problem, setProblem] = useState<string | undefined>()
@@ -166,6 +318,40 @@ function Content() {
   // only destructive thing here, and it should be an act rather than a setting someone turned on
   // once. Turn it on after a dry run shows the right values.
   const [write, setWrite] = useState(false)
+  const [state, setState] = useState<AgentState | null>(null)
+  const [version, setVersion] = useState<AgentVersion | null>(null)
+  // Which warnings have already been toasted, so a standing warning is announced once rather than
+  // every refresh. A panel that toasts the same thing every minute gets uninstalled.
+  const [toasted, setToasted] = useState<Set<string>>(new Set())
+
+  const refreshStatus = async () => {
+    const [s, v] = await Promise.all([fetchState(), fetchVersion()])
+    if (v.ok) setVersion(v.data)
+    if (!s.ok) { setState(null); return }
+    setState(s.data)
+
+    const fresh = s.data.leaseWarnings.filter((w) => !toasted.has(w.gameName))
+    if (fresh.length > 0) {
+      for (const w of fresh) {
+        toaster.toast({
+          title: 'SaveLocker',
+          body: `${w.gameName} is checked out on ${w.holderMachine}`,
+        })
+      }
+      setToasted((prev) => new Set([...prev, ...fresh.map((w) => w.gameName)]))
+    }
+  }
+
+  const dismiss = async (gameName: string) => {
+    await dismissWarning(gameName)
+    // Forget it here too, or the same warning could never be announced again this session.
+    setToasted((prev) => {
+      const next = new Set(prev)
+      next.delete(gameName)
+      return next
+    })
+    await refreshStatus()
+  }
 
   const run = async (announce: boolean, writeNow: boolean) => {
     setBusy(true)
@@ -192,13 +378,20 @@ function Content() {
   useEffect(() => {
     // The automatic pass NEVER writes. Only the button does, and only with the toggle on.
     void run(false, false)
+    void refreshStatus()
     // Enrollment is rare, so this is a slow safety net rather than a poll. Idempotence on the agent
     // side is what makes re-running it free.
     const timer = setInterval(() => void run(false, false), 5 * 60 * 1000)
-    return () => clearInterval(timer)
+    // Status is cheap and time-sensitive in a way launch options are not: a lease taken on another
+    // machine while this panel is open is exactly what the warning is for.
+    const statusTimer = setInterval(() => void refreshStatus(), 30 * 1000)
+    return () => { clearInterval(timer); clearInterval(statusTimer) }
   }, [])
 
   return (
+    <>
+    <LeaseWarnings warnings={state?.leaseWarnings ?? []} onDismiss={(g) => void dismiss(g)} />
+    <Status state={state} version={version} />
     <PanelSection title="Launch options">
       <PanelSectionRow>
         <ToggleField
@@ -272,6 +465,8 @@ function Content() {
         </Focusable>
       </PanelSectionRow>
     </PanelSection>
+    <Diagnostics />
+    </>
   )
 }
 

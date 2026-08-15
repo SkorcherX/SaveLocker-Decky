@@ -1,11 +1,12 @@
 {
   "name": "SaveLocker",
   "author": "SkorcherX",
-  "flags": [],
+  "//flags": "debug is the RELOAD OPT-IN, not a dev switch: loader.py refuses to re-load a plugin whose files changed unless 'debug' is in flags ('Plugin X is already loaded and has requested to not be re-loaded'). It is the flag's only effect anywhere in the loader, and store plugins ship with it. Without it, updating the files on disk does nothing until Decky restarts. NOT 'root' — see README.",
+  "flags": ["debug"],
   "api_version": 1,
   "publish": {
     "tags": ["saves", "sync", "utility"],
     "description": "Sets the Steam launch options SaveLocker needs, so a Deck syncs saves without pasting a command into every game.",
-    "image": "https://opengraph.githubassets.com/1/SkorcherX/SaveLocker"
+    "image": "https://opengraph.githubassets.com/1/SkorcherX/SaveLocker-Decky"
   }
 }
