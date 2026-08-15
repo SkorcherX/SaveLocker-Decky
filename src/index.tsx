@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ButtonItem, PanelSection, PanelSectionRow, staticClasses } from '@decky/ui'
+import { ButtonItem, PanelSection, PanelSectionRow, ToggleField, staticClasses } from '@decky/ui'
 import { callable, definePlugin, toaster } from '@decky/api'
 import { FaGamepad } from 'react-icons/fa'
 
@@ -70,7 +70,10 @@ function currentLaunchOptions(appId: number): Promise<string> {
 
 interface Outcome {
   name: string
-  state: 'written' | 'already-correct' | 'failed'
+  state: 'written' | 'already-correct' | 'failed' | 'would-write'
+  /** Exactly what was read out of Steam. Shown verbatim — it is the evidence, not a summary. */
+  current: string
+  target: string
   detail?: string
 }
 
@@ -81,7 +84,7 @@ interface Outcome {
  * set; a user running mangohud, setting environment variables or passing per-game arguments has
  * something set, and the resolve round trip is what preserves it.
  */
-async function applyAll(): Promise<{ outcomes: Outcome[]; problem?: string }> {
+async function applyAll(write: boolean): Promise<{ outcomes: Outcome[]; problem?: string }> {
   const rows = await fetchRows()
   if (!rows.ok) return { outcomes: [], problem: rows.reason }
   if (rows.data.length === 0) return { outcomes: [] }
@@ -92,6 +95,7 @@ async function applyAll(): Promise<{ outcomes: Outcome[]; problem?: string }> {
       current: await currentLaunchOptions(row.steamAppId),
     })),
   )
+  const currentByAppId = new Map(current.map((c) => [c.steamAppId, c.current]))
 
   const resolved = await resolveOptions(current)
   if (!resolved.ok) return { outcomes: [], problem: resolved.reason }
@@ -102,22 +106,34 @@ async function applyAll(): Promise<{ outcomes: Outcome[]; problem?: string }> {
   for (const row of rows.data) {
     const target = byAppId.get(row.steamAppId)
     if (!target) continue
+    const was = currentByAppId.get(row.steamAppId) ?? ''
+    const base = { name: row.name, current: was, target: target.desired }
 
     if (!target.changed) {
-      outcomes.push({ name: row.name, state: 'already-correct' })
+      outcomes.push({ ...base, state: 'already-correct' })
       // Reported anyway: "already correct" is exactly as much of an answer to "are this game's
       // launch options set?" as having just written them, and doctor should be able to say so.
-      await report(row.steamAppId, true, null)
+      // Not in dry run — nothing has been confirmed if nothing was allowed to act.
+      if (write) await report(row.steamAppId, true, null)
+      continue
+    }
+
+    // Dry run stops here, having read everything and changed nothing. This is the mode a first run
+    // on real hardware wants: if the field this plugin reads is the wrong one, it sees an empty
+    // string, concludes the game has no options, and would clobber a real mangohud line. Better to
+    // be shown that in a list than to discover it afterwards.
+    if (!write) {
+      outcomes.push({ ...base, state: 'would-write' })
       continue
     }
 
     try {
       SteamClient.Apps.SetAppLaunchOptions(row.steamAppId, target.desired)
-      outcomes.push({ name: row.name, state: 'written' })
+      outcomes.push({ ...base, state: 'written' })
       await report(row.steamAppId, true, null)
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err)
-      outcomes.push({ name: row.name, state: 'failed', detail })
+      outcomes.push({ ...base, state: 'failed', detail })
       await report(row.steamAppId, false, detail)
     }
   }
@@ -129,11 +145,15 @@ function Content() {
   const [outcomes, setOutcomes] = useState<Outcome[]>([])
   const [problem, setProblem] = useState<string | undefined>()
   const [busy, setBusy] = useState(false)
+  // Off on every load, deliberately, and not persisted. Writing to Steam's launch options is the
+  // only destructive thing here, and it should be an act rather than a setting someone turned on
+  // once. Turn it on after a dry run shows the right values.
+  const [write, setWrite] = useState(false)
 
-  const run = async (announce: boolean) => {
+  const run = async (announce: boolean, writeNow: boolean) => {
     setBusy(true)
     try {
-      const result = await applyAll()
+      const result = await applyAll(writeNow)
       setOutcomes(result.outcomes)
       setProblem(result.problem)
       const written = result.outcomes.filter((o) => o.state === 'written').length
@@ -153,18 +173,27 @@ function Content() {
   }
 
   useEffect(() => {
-    void run(false)
+    // The automatic pass NEVER writes. Only the button does, and only with the toggle on.
+    void run(false, false)
     // Enrollment is rare, so this is a slow safety net rather than a poll. Idempotence on the agent
     // side is what makes re-running it free.
-    const timer = setInterval(() => void run(false), 5 * 60 * 1000)
+    const timer = setInterval(() => void run(false, false), 5 * 60 * 1000)
     return () => clearInterval(timer)
   }, [])
 
   return (
     <PanelSection title="Launch options">
       <PanelSectionRow>
-        <ButtonItem layout="below" disabled={busy} onClick={() => void run(true)}>
-          {busy ? 'Checking…' : 'Apply now'}
+        <ToggleField
+          label="Allow writing to Steam"
+          description="Off: read and show what would change. On: actually set launch options."
+          checked={write}
+          onChange={setWrite}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy} onClick={() => void run(true, write)}>
+          {busy ? 'Checking…' : write ? 'Apply now' : 'Check (no changes)'}
         </ButtonItem>
       </PanelSectionRow>
 
@@ -182,11 +211,22 @@ function Content() {
         <PanelSectionRow>No tracked game launches through Steam.</PanelSectionRow>
       )}
 
-      {/* Everything it did, always visible. A plugin that edits Steam settings without showing
-          what it changed is one nobody should trust. */}
+      {/* Everything it did, always visible, including what it READ. A plugin that edits Steam
+          settings without showing what it changed is one nobody should trust — and on a first run
+          the current value is the whole diagnostic: if it comes back empty for a game you know has
+          options, this is reading the wrong field and must not be allowed to write. */}
       {outcomes.map((o) => (
         <PanelSectionRow key={o.name}>
-          {o.name}: {o.state === 'written' ? 'set' : o.state === 'already-correct' ? 'already set' : `failed — ${o.detail}`}
+          <div style={{ fontSize: '0.8em', wordBreak: 'break-all' }}>
+            <div><b>{o.name}</b> — {
+              o.state === 'written' ? 'set'
+                : o.state === 'already-correct' ? 'already set'
+                  : o.state === 'would-write' ? 'would change (not written)'
+                    : `failed — ${o.detail}`
+            }</div>
+            <div>now: {o.current === '' ? '(empty)' : o.current}</div>
+            {o.state !== 'already-correct' && <div>target: {o.target}</div>}
+          </div>
         </PanelSectionRow>
       ))}
     </PanelSection>
