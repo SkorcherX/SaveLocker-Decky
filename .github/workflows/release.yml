@@ -1,0 +1,97 @@
+name: Build and release plugin
+
+# A tag builds the bundle, packages it exactly as Decky installs it, publishes the zip, and
+# regenerates the store index that points at it. The index carries the zip's SHA-256, which Decky
+# verifies before unpacking — so the index and the artifact must be produced together, by this job,
+# or a user gets a hash mismatch and no plugin.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package the way Decky unpacks it
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Decky extracts the zip straight into ~/homebrew/plugins and then looks for
+          # "<folder>/plugin.json" exactly one level down, so the zip must contain a single
+          # top-level directory named for the plugin.
+          mkdir -p "staging/SaveLocker"
+          cp plugin.json package.json main.py "staging/SaveLocker/"
+          cp -r dist "staging/SaveLocker/dist"
+          (cd staging && zip -qr "../SaveLocker.zip" SaveLocker)
+
+          # Assert the layout rather than trust it: a zip that unpacks wrong installs a plugin
+          # Decky cannot see, and the failure appears on a user's device, not here.
+          unzip -l SaveLocker.zip | grep -q "SaveLocker/plugin.json" \
+            || { echo "::error::plugin.json is not one level down in the zip"; exit 1; }
+          unzip -l SaveLocker.zip | grep -q "SaveLocker/dist/index.js" \
+            || { echo "::error::dist/index.js missing from the zip"; exit 1; }
+          # package.json decides how Decky LOADS the plugin: without it the ESM bundle is eval'd as
+          # a classic script and dies on its own last line. See README.
+          unzip -l SaveLocker.zip | grep -q "SaveLocker/package.json" \
+            || { echo "::error::package.json missing — Decky would use the legacy loader"; exit 1; }
+
+          sha="$(sha256sum SaveLocker.zip | cut -d' ' -f1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"         >> "$GITHUB_OUTPUT"
+          echo "SaveLocker.zip  $sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SaveLocker.zip
+          fail_on_unmatched_files: true
+
+      - name: Regenerate the store index
+        run: |
+          version="${{ steps.package.outputs.version }}"
+          sha="${{ steps.package.outputs.sha }}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/SaveLocker.zip"
+
+          mkdir -p store
+          # The shape Decky's getPluginList() expects: StorePlugin[]. `artifact` is used verbatim
+          # when present, which is what lets this point at a GitHub release instead of Decky's CDN.
+          # versions[0] is the one update checks compare against, so newest must be first.
+          cat > store/plugins <<EOF
+          [
+            {
+              "id": 1,
+              "name": "SaveLocker",
+              "author": "SkorcherX",
+              "description": "Sets the Steam launch options SaveLocker needs, so a Deck syncs saves without pasting a command into every game.",
+              "tags": ["saves", "sync", "utility"],
+              "image_url": "https://opengraph.githubassets.com/1/${GITHUB_REPOSITORY}",
+              "versions": [
+                { "name": "${version}", "hash": "${sha}", "artifact": "${url}" }
+              ]
+            }
+          ]
+          EOF
+          python3 -c "import json;json.load(open('store/plugins'))" || { echo "::error::store index is not valid JSON"; exit 1; }
+          cat store/plugins
+
+      - name: Commit the store index
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add store/plugins
+          git diff --staged --quiet || git commit -m "Store index for ${GITHUB_REF_NAME}"
+          git push origin HEAD:main
