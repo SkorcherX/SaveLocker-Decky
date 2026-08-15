@@ -1,0 +1,13 @@
+[
+  {
+    "id": 1,
+    "name": "SaveLocker",
+    "author": "SkorcherX",
+    "description": "Sets the Steam launch options SaveLocker needs, so a Deck syncs saves without pasting a command into every game.",
+    "tags": ["saves", "sync", "utility"],
+    "image_url": "https://opengraph.githubassets.com/1/SkorcherX/SaveLocker-Decky",
+    "versions": [
+      { "name": "0.1.0", "hash": "356dbdbb553540854d2838160dc0e3e7ed096e7ea91fce88bbd1d5e1d4eb3b8e", "artifact": "https://github.com/SkorcherX/SaveLocker-Decky/releases/download/v0.1.0/SaveLocker.zip" }
+    ]
+  }
+]
