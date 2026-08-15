@@ -1,5 +1,23 @@
 import { useEffect, useState } from 'react'
-import { ButtonItem, Focusable, PanelSection, PanelSectionRow, ToggleField, staticClasses } from '@decky/ui'
+import {
+  ButtonItem, ConfirmModal, DropdownItem, Field, Focusable, PanelSection, PanelSectionRow,
+  ToggleField, showModal, staticClasses,
+} from '@decky/ui'
+
+/**
+ * A read-only row the D-pad can actually land on.
+ *
+ * `Field`'s own `focusable` prop, not a bare `Focusable`: the QAM scrolls by MOVING FOCUS, and a
+ * `Focusable` with no handler is not reliably a navigation target — so a block of them is a hole the
+ * D-pad skips, and scrolling up into it jumps to the back button instead. Every read-only row in
+ * this panel goes through here for that reason.
+ */
+const ReadOnlyRow = ({ children }: { children: React.ReactNode; key?: string | number }) => (
+  <Field focusable={true} bottomSeparator="none" childrenLayout="below"
+         childrenContainerWidth="max">
+    {children}
+  </Field>
+)
 import { callable, definePlugin, toaster } from '@decky/api'
 import { FaGamepad } from 'react-icons/fa'
 
@@ -59,12 +77,20 @@ interface DoctorResult {
   output: string
 }
 
+interface TrackedGame {
+  gameId: string
+  name: string
+  saveDirectory: string
+}
+
 type AgentResult<T> = { ok: true; data: T } | { ok: false; reason: string }
 
 const fetchRows = callable<[], AgentResult<Row[]>>('rows')
 const resolveOptions =
   callable<[{ steamAppId: number; current: string }[]], AgentResult<Resolved[]>>('resolve')
 const report = callable<[number, boolean, string | null], AgentResult<null>>('report')
+const fetchGames = callable<[], AgentResult<TrackedGame[]>>('games')
+const runSync = callable<[string, string | null, boolean], AgentResult<DoctorResult>>('sync')
 const fetchState = callable<[], AgentResult<AgentState>>('state')
 const fetchVersion = callable<[], AgentResult<AgentVersion>>('agent_version')
 const dismissWarning = callable<[string], AgentResult<null>>('dismiss_warning')
@@ -206,12 +232,12 @@ function LeaseWarnings({ warnings, onDismiss }: {
     <PanelSection title="Checked out elsewhere">
       {warnings.map((w) => (
         <PanelSectionRow key={w.gameName}>
-          <Focusable style={{ padding: '4px 6px', fontSize: '0.85em' }}>
-            <div><b>{w.gameName}</b></div>
+          <ReadOnlyRow>
+            <div style={{ fontSize: '0.85em' }}><b>{w.gameName}</b></div>
             <div style={{ opacity: 0.75 }}>
               open on {w.holderMachine}. Playing here may cause a conflict.
             </div>
-          </Focusable>
+          </ReadOnlyRow>
         </PanelSectionRow>
       ))}
       {warnings.map((w) => (
@@ -227,27 +253,182 @@ function LeaseWarnings({ warnings, onDismiss }: {
   )
 }
 
+/**
+ * Read-only status.
+ *
+ * The whole block is ONE Focusable, and that shape is deliberate. Steam's Quick Access panel scrolls
+ * by moving focus, so a run of non-focusable rows between focusable ones is a hole the D-pad cannot
+ * land in: scrolling up into it reveals a line, finds nothing to focus, and jumps to the back button
+ * — leaving the user toggling up/down to inch through. One focusable block is a single stop that
+ * scrolls into view whole. Several focusable lines would fix the jumping too, but would make the
+ * user press down five times to get past information they only read.
+ */
 function Status({ state, version }: { state: AgentState | null; version: AgentVersion | null }) {
   if (!state) return null
   const line = (label: string, value: string) => (
-    <PanelSectionRow>
-      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', gap: '8px' }}>
-        <span style={{ opacity: 0.7 }}>{label}</span>
-        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
-      </div>
-    </PanelSectionRow>
+    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', gap: '8px' }}>
+      <span style={{ opacity: 0.7 }}>{label}</span>
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
+    </div>
   )
   return (
     <PanelSection title="Status">
-      {line('Server', state.connected ? state.machineName : 'not connected')}
-      {line('Last sync', state.lastSyncAgo)}
-      {line('Games', String(state.gamesTracked))}
-      {line('Saves pushed', String(state.savesBacked))}
-      {/* The agent already stages its own update and applies it at next start; this is the only
-          place on a Deck in Game Mode that says so before the reboot happens. */}
-      {version?.updateAvailable
-        ? line('Agent', `${version.currentVersion} → ${version.latestVersion} ready`)
-        : line('Agent', state.currentVersion)}
+      <PanelSectionRow>
+        <ReadOnlyRow>
+          {line('Server', state.connected ? state.machineName : 'not connected')}
+          {line('Last sync', state.lastSyncAgo)}
+          {line('Games', String(state.gamesTracked))}
+          {line('Saves pushed', String(state.savesBacked))}
+          {/* The agent already stages its own update and applies it at next start; this is the only
+              place on a Deck in Game Mode that says so before the reboot happens. */}
+          {version?.updateAvailable
+            ? line('Agent', `${version.currentVersion} → ${version.latestVersion} ready`)
+            : line('Agent', state.currentVersion)}
+        </ReadOnlyRow>
+      </PanelSectionRow>
+    </PanelSection>
+  )
+}
+
+/**
+ * Push and pull, for one game or all of them.
+ *
+ * The plain buttons cannot lose data — the agent refuses a pull while the game is running, refuses
+ * one that would overwrite un-pushed local changes, and turns a diverged push into a conflict rather
+ * than overwriting the server. `--force` defeats the middle two, and is the only way to lose
+ * progress from this panel, so it goes through a confirmation that names the game and says what is
+ * lost. Deliberately not a toggle: a toggle left on makes the NEXT press destructive too.
+ */
+const ALL_GAMES = '__all_games__'
+
+/**
+ * The sync target, held at MODULE scope rather than in component state.
+ *
+ * Opening Steam's dropdown tears down and rebuilds the Quick Access panel content, so a selection
+ * made in it is destroyed by the very act of making it — the component remounts and every useState
+ * goes back to its initial value. Measured on hardware: the render immediately after a selection
+ * reports `games = 0`, i.e. the parent's state reset too, not just this component's.
+ *
+ * Module scope outlives that remount. It resets if the plugin itself is reloaded, which is correct:
+ * this is a transient UI choice, not a setting worth persisting.
+ */
+let stickyTarget: string | null = null
+
+function Sync({ games }: { games: TrackedGame[] }) {
+  const [target, setTargetState] = useState<string | null>(stickyTarget) // null = all games
+  const setTarget = (value: string | null) => { stickyTarget = value; setTargetState(value) }
+  const [busy, setBusy] = useState<string | null>(null)
+  const [result, setResult] = useState<{ label: string; exitCode: number; output: string } | null>(null)
+  const [problem, setProblem] = useState<string | null>(null)
+
+  const targetName = target ?? 'all games'
+
+  const go = async (action: 'push' | 'pull', force: boolean) => {
+    const label = `${force ? 'force ' : ''}${action} ${targetName}`
+    setBusy(label)
+    setProblem(null)
+    try {
+      const r = await runSync(action, target, force)
+      if (r.ok) {
+        setResult({ label, exitCode: r.data.exitCode, output: r.data.output })
+        // A manual sync is worth announcing even though the result is listed below: it can take a
+        // while, and the user may have closed the panel or started a game before it finishes.
+        toaster.toast({
+          title: 'SaveLocker',
+          body: r.data.exitCode === 0 ? `${label} finished` : `${label} failed — see the plugin`,
+        })
+      } else {
+        setResult(null)
+        setProblem(r.reason)
+      }
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const confirmForce = (action: 'push' | 'pull') => {
+    const consequence = action === 'push'
+      ? `This replaces the server's copy for ${targetName} with this device's save. Every other machine will pull it.`
+      : `This discards this device's save for ${targetName} and takes the server's copy. Unsynced progress here is lost.`
+    showModal(
+      <ConfirmModal
+        bDestructiveWarning
+        strTitle={`Force ${action} ${targetName}?`}
+        strDescription={consequence}
+        strOKButtonText={`Force ${action}`}
+        onOK={() => void go(action, true)}
+      />,
+    )
+  }
+
+  return (
+    <PanelSection title="Sync">
+      <PanelSectionRow>
+        <DropdownItem
+          label="Target"
+          rgOptions={[
+            { data: ALL_GAMES, label: 'All games' },
+            ...games.map((g) => ({ data: g.name, label: g.name })),
+          ]}
+          selectedOption={target ?? ALL_GAMES}
+          onChange={(o: any) => {
+            // Steam's own Dropdown, resolved out of CommonUIModule by shape — its callback contract
+            // is not ours to assume, so accept either the option object or a bare value.
+            const picked = o && typeof o === 'object' && 'data' in o ? o.data : o
+            setTarget(picked === ALL_GAMES || picked == null ? null : String(picked))
+          }}
+        />
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy !== null} onClick={() => void go('push', false)}>
+          {busy === `push ${targetName}` ? 'Pushing…' : `Push ${targetName}`}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy !== null} onClick={() => void go('pull', false)}>
+          {busy === `pull ${targetName}` ? 'Pulling…' : `Pull ${targetName}`}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy !== null} onClick={() => confirmForce('push')}>
+          {`Force push ${targetName}…`}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy !== null} onClick={() => confirmForce('pull')}>
+          {`Force pull ${targetName}…`}
+        </ButtonItem>
+      </PanelSectionRow>
+
+      {problem && (
+        <PanelSectionRow>
+          <ReadOnlyRow>
+            {problem === 'no-agent' ? 'SaveLocker is not installed on this device.'
+              : problem === 'timeout' ? 'The sync did not finish within 10 minutes.'
+                : `Could not run it (${problem}).`}
+          </ReadOnlyRow>
+        </PanelSectionRow>
+      )}
+
+      {result && (
+        <PanelSectionRow>
+          <Focusable style={{ display: 'flex', flexDirection: 'column' }}>
+            <ReadOnlyRow>
+              <span style={{ fontSize: '0.8em', opacity: 0.8 }}>
+                {result.label} — {result.exitCode === 0 ? 'ok' : `exit ${result.exitCode}`}
+              </span>
+            </ReadOnlyRow>
+            {/* The agent's own words, not a summary of them: a refusal explains itself ("X is
+                running — pull refused"), and paraphrasing that would lose the reason. */}
+            {result.output.split('\n').filter((l) => l.trim() !== '').slice(-12).map((l, i) => (
+              <ReadOnlyRow key={i}>
+                <span style={{ fontSize: '0.72em', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{l}</span>
+              </ReadOnlyRow>
+            ))}
+          </Focusable>
+        </PanelSectionRow>
+      )}
     </PanelSection>
   )
 }
@@ -285,23 +466,27 @@ function Diagnostics() {
       </PanelSectionRow>
       {problem && (
         <PanelSectionRow>
-          {problem === 'no-agent' ? 'SaveLocker is not installed on this device.'
-            : problem === 'timeout' ? 'doctor did not finish within 60 seconds.'
-              : `Could not run doctor (${problem}).`}
+          <ReadOnlyRow>
+            {problem === 'no-agent' ? 'SaveLocker is not installed on this device.'
+              : problem === 'timeout' ? 'doctor did not finish within 60 seconds.'
+                : `Could not run doctor (${problem}).`}
+          </ReadOnlyRow>
         </PanelSectionRow>
       )}
       {result && (
         <PanelSectionRow>
           <Focusable style={{ display: 'flex', flexDirection: 'column' }}>
-            <div style={{ fontSize: '0.8em', opacity: 0.75, marginBottom: '4px' }}>
-              {result.exitCode === 0 ? 'No problems found.' : `Exited ${result.exitCode} — see below.`}
-            </div>
+            <ReadOnlyRow>
+              <span style={{ fontSize: '0.8em', opacity: 0.75 }}>
+                {result.exitCode === 0 ? 'No problems found.' : `Exited ${result.exitCode} — see below.`}
+              </span>
+            </ReadOnlyRow>
             {/* Every line focusable, or the D-pad cannot reach past the fold and doctor's output is
                 far longer than one screen. */}
             {result.output.split('\n').filter((l) => l.trim() !== '').map((l, i) => (
-              <Focusable key={i} style={{ fontSize: '0.72em', whiteSpace: 'pre-wrap', wordBreak: 'break-all', padding: '1px 4px' }}>
-                {l}
-              </Focusable>
+              <ReadOnlyRow key={i}>
+                <span style={{ fontSize: '0.72em', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{l}</span>
+              </ReadOnlyRow>
             ))}
           </Focusable>
         </PanelSectionRow>
@@ -320,13 +505,15 @@ function Content() {
   const [write, setWrite] = useState(false)
   const [state, setState] = useState<AgentState | null>(null)
   const [version, setVersion] = useState<AgentVersion | null>(null)
+  const [games, setGames] = useState<TrackedGame[]>([])
   // Which warnings have already been toasted, so a standing warning is announced once rather than
   // every refresh. A panel that toasts the same thing every minute gets uninstalled.
   const [toasted, setToasted] = useState<Set<string>>(new Set())
 
   const refreshStatus = async () => {
-    const [s, v] = await Promise.all([fetchState(), fetchVersion()])
+    const [s, v, g] = await Promise.all([fetchState(), fetchVersion(), fetchGames()])
     if (v.ok) setVersion(v.data)
+    if (g.ok) setGames(g.data)
     if (!s.ok) { setState(null); return }
     setState(s.data)
 
@@ -353,23 +540,16 @@ function Content() {
     await refreshStatus()
   }
 
-  const run = async (announce: boolean, writeNow: boolean) => {
+  const run = async (writeNow: boolean) => {
     setBusy(true)
     try {
       const result = await applyAll(writeNow)
       setOutcomes(result.outcomes)
       setProblem(result.problem)
-      const written = result.outcomes.filter((o) => o.state === 'written').length
-      // Only ever toast for a change the user did not ask for. A sweep that found nothing to do is
-      // the normal case and must stay silent, or this becomes something people uninstall.
-      if (written > 0) {
-        toaster.toast({
-          title: 'SaveLocker',
-          body: `Launch options set for ${written} game${written === 1 ? '' : 's'}`,
-        })
-      } else if (announce && !result.problem) {
-        toaster.toast({ title: 'SaveLocker', body: 'Launch options already correct' })
-      }
+      // No toast here either. Writes only happen when the user presses the button, and the outcome
+      // list is right underneath it — announcing what someone is already looking at is noise. The
+      // one thing worth interrupting for is a lease warning, which arrives on a timer while the
+      // panel is closed.
     } finally {
       setBusy(false)
     }
@@ -377,11 +557,11 @@ function Content() {
 
   useEffect(() => {
     // The automatic pass NEVER writes. Only the button does, and only with the toggle on.
-    void run(false, false)
+    void run(false)
     void refreshStatus()
     // Enrollment is rare, so this is a slow safety net rather than a poll. Idempotence on the agent
     // side is what makes re-running it free.
-    const timer = setInterval(() => void run(false, false), 5 * 60 * 1000)
+    const timer = setInterval(() => void run(false), 5 * 60 * 1000)
     // Status is cheap and time-sensitive in a way launch options are not: a lease taken on another
     // machine while this panel is open is exactly what the warning is for.
     const statusTimer = setInterval(() => void refreshStatus(), 30 * 1000)
@@ -402,28 +582,30 @@ function Content() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" disabled={busy} onClick={() => void run(true, write)}>
+        <ButtonItem layout="below" disabled={busy} onClick={() => void run(write)}>
           {busy ? 'Checking…' : write ? 'Apply now' : 'Check (no changes)'}
         </ButtonItem>
       </PanelSectionRow>
 
       {problem === 'no-agent' && (
-        <PanelSectionRow>SaveLocker is not installed on this device.</PanelSectionRow>
+        <PanelSectionRow><ReadOnlyRow>SaveLocker is not installed on this device.</ReadOnlyRow></PanelSectionRow>
       )}
       {problem === 'unreachable' && (
-        <PanelSectionRow>The SaveLocker agent is not running.</PanelSectionRow>
+        <PanelSectionRow><ReadOnlyRow>The SaveLocker agent is not running.</ReadOnlyRow></PanelSectionRow>
       )}
       {problem && problem !== 'no-agent' && problem !== 'unreachable' && (
-        <PanelSectionRow>Could not reach the SaveLocker agent ({problem}).</PanelSectionRow>
+        <PanelSectionRow><ReadOnlyRow>Could not reach the SaveLocker agent ({problem}).</ReadOnlyRow></PanelSectionRow>
       )}
 
       {!problem && outcomes.length === 0 && (
-        <PanelSectionRow>No tracked game launches through Steam.</PanelSectionRow>
+        <PanelSectionRow><ReadOnlyRow>No tracked game launches through Steam.</ReadOnlyRow></PanelSectionRow>
       )}
 
       {outcomes.length > 0 && (
         <PanelSectionRow>
-          <div style={{ fontSize: '0.85em', opacity: 0.8 }}>{summarise(outcomes)}</div>
+          <ReadOnlyRow>
+            <span style={{ fontSize: '0.85em', opacity: 0.8 }}>{summarise(outcomes)}</span>
+          </ReadOnlyRow>
         </PanelSectionRow>
       )}
 
@@ -438,11 +620,8 @@ function Content() {
       <PanelSectionRow>
         <Focusable style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
           {outcomes.map((o) => (
-            <Focusable
-              key={o.name}
-              style={{ padding: '4px 6px', borderRadius: '4px', fontSize: '0.8em' }}
-              focusWithinClassName="gpfocuswithin"
-            >
+            <ReadOnlyRow key={o.name}>
+              <div style={{ fontSize: '0.8em', width: '100%' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {o.name}
@@ -460,11 +639,13 @@ function Content() {
                   {o.detail && <div>error: {o.detail}</div>}
                 </div>
               )}
-            </Focusable>
+              </div>
+            </ReadOnlyRow>
           ))}
         </Focusable>
       </PanelSectionRow>
     </PanelSection>
+    <Sync games={games} />
     <Diagnostics />
     </>
   )

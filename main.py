@@ -133,6 +133,56 @@ class Plugin:
             decky.logger.warning("could not run doctor: %s", err)
             return {"ok": False, "reason": "exec-failed"}
 
+    async def games(self):
+        """Every game this machine tracks — not just the ones Steam launches."""
+        return _request("/api/games")
+
+    async def sync(self, action: str, game: str | None = None, force: bool = False):
+        """
+        Run `savelocker push|pull [game|all] [--force]`.
+
+        Executed rather than reimplemented, so it inherits every guard the agent already has instead
+        of this plugin growing its own opinion about when a sync is safe:
+
+          * `pull` refuses while the game is running — checked in the CLI and AGAIN in SyncEngine,
+            and forcing does not override it.
+          * a plain `pull` refuses to overwrite local saves holding un-pushed changes;
+          * a plain `push` that diverged becomes a conflict rather than overwriting the server head.
+
+        `--force` defeats the first two of those and is the only way to lose data here, which is why
+        the caller has to confirm it against a named target.
+        """
+        if action not in ("push", "pull"):
+            return {"ok": False, "reason": "bad-action"}
+
+        binary = _agent_binary()
+        if binary is None:
+            return {"ok": False, "reason": "no-agent"}
+
+        # A list, never a shell string: a game name is user data and can contain anything.
+        args = [binary, action, game or "all"]
+        if force:
+            args.append("--force")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            # Generous: a push waits out the settle gate, and a big save over a slow link is slower
+            # still. Better to wait than to orphan a sync half-done.
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+            return {"ok": True, "data": {"exitCode": proc.returncode,
+                                         "output": stdout.decode("utf-8", "replace")}}
+        except asyncio.TimeoutError:
+            try: proc.kill()
+            except Exception: pass
+            return {"ok": False, "reason": "timeout"}
+        except OSError as err:
+            decky.logger.warning("could not run %s: %s", action, err)
+            return {"ok": False, "reason": "exec-failed"}
+
     async def rows(self):
         """Every tracked game Steam launches, and what it should carry."""
         return _request("/api/launch-options")
