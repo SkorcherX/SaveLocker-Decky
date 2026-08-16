@@ -66,10 +66,26 @@ interface AgentState {
   leaseWarnings: LeaseWarning[]
 }
 
+/**
+ * `updateAvailable` and `stagedVersion` are different states and only one of them is actionable
+ * from here.
+ *
+ * Available means the server is offering something newer and nothing has been downloaded: taking it
+ * needs network, a download, a digest check and a smoke test, any of which can fail and all of which
+ * take a while. Staged means the payload is already on this disk, verified against the published
+ * SHA-256 and smoke-tested — applying it is a file copy and a restart, which works offline and
+ * cannot fail for any of the reasons a download can.
+ *
+ * The "Install update now" button is offered for `stagedVersion` and never for `updateAvailable`,
+ * because on the second it would be promising something it cannot deliver quickly or offline.
+ */
 interface AgentVersion {
   currentVersion: string
   latestVersion: string | null
   updateAvailable: boolean
+  stagedVersion: string | null
+  /** Why restarting right now would install nothing. The agent's own sentence — show it verbatim. */
+  stagedBlockedReason: string | null
 }
 
 interface DoctorResult {
@@ -95,6 +111,7 @@ const fetchState = callable<[], AgentResult<AgentState>>('state')
 const fetchVersion = callable<[], AgentResult<AgentVersion>>('agent_version')
 const dismissWarning = callable<[string], AgentResult<null>>('dismiss_warning')
 const runDoctor = callable<[], AgentResult<DoctorResult>>('doctor')
+const restartAgent = callable<[], AgentResult<null>>('restart_agent')
 
 /**
  * A game's launch options as Steam holds them right now.
@@ -279,15 +296,150 @@ function Status({ state, version }: { state: AgentState | null; version: AgentVe
           {line('Last sync', state.lastSyncAgo)}
           {line('Games', String(state.gamesTracked))}
           {line('Saves pushed', String(state.savesBacked))}
-          {/* The agent already stages its own update and applies it at next start; this is the only
-              place on a Deck in Game Mode that says so before the reboot happens. */}
-          {version?.updateAvailable
-            ? line('Agent', `${version.currentVersion} → ${version.latestVersion} ready`)
-            : line('Agent', state.currentVersion)}
+          {/* Staged and available are not the same thing and must not read the same. "ready" is
+              only true of a payload that is already here and verified — the one the Update section
+              below can install on the spot. */}
+          {version?.stagedVersion
+            ? line('Agent', `${version.currentVersion} → ${version.stagedVersion} ready`)
+            : version?.updateAvailable
+              ? line('Agent', `${version.currentVersion} → ${version.latestVersion} available`)
+              : line('Agent', state.currentVersion)}
         </ReadOnlyRow>
       </PanelSectionRow>
     </PanelSection>
   )
+}
+
+/**
+ * "Install update now" — the only thing on a Deck that can take a waiting update without a terminal.
+ *
+ * Without this, a staged update says it will be installed "the next time this device starts
+ * SaveLocker" and offers nothing. That phrase means the `savelocker.service` systemd `--user` unit
+ * starting, which nothing on screen says, so the routes to it are a reboot or a terminal — neither
+ * of which is where the notice is being read.
+ *
+ * **Only ever offered for `stagedVersion`.** A merely-available update needs a network round trip
+ * that can fail; this one is a file copy the agent has already verified, so pressing the button is
+ * the last step rather than the first.
+ *
+ * The button destroys the API this panel is talking to. That is not a hazard to work around — it is
+ * how the update installs — so `unreachable` during the wait is the expected shape of SUCCESS, and
+ * anything that error-toasts on the first failed call reports a working update as a failure.
+ */
+function StagedUpdate({ version, onSettled }: {
+  version: AgentVersion | null
+  onSettled: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [outcome, setOutcome] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const staged = version?.stagedVersion ?? null
+  const blocked = version?.stagedBlockedReason ?? null
+
+  // Success REMOVES the thing this section is about: the staged marker is gone the moment the swap
+  // lands, so `staged` goes null and this would unmount with the result unread. The outcome keeps
+  // the section on screen by itself — a press that ends with a row quietly disappearing is
+  // indistinguishable from a press that did nothing.
+  if (!staged && !outcome) return null
+
+  const install = async () => {
+    const before = version?.currentVersion ?? ''
+    setBusy(true)
+    setOutcome(null)
+    try {
+      const restarted = await restartAgent()
+      if (!restarted.ok) {
+        setOutcome({ ok: false, text: describeRestartFailure(restarted.reason) })
+        return
+      }
+
+      // systemctl returns once the unit is active, but the agent's HTTP listener comes up a moment
+      // after that, so the first few polls legitimately fail. Success is not a version string match
+      // — the agent prints Major.Minor.Patch and the server's string need not agree on component
+      // count — it is the staged marker being GONE, which only happens once the swap ran.
+      const deadline = Date.now() + 120_000
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000))
+        const v = await fetchVersion()
+        if (!v.ok) continue
+
+        if (v.data.stagedVersion === null) {
+          setOutcome(v.data.currentVersion === before
+            // Applied, and the agent came back on the version it started on. The updater rolls a
+            // version back by itself when it will not start, so this is what that looks like from
+            // here — and saying "installed" would be a lie the user finds out about later.
+            ? { ok: false, text: `The agent restarted but is still on v${before}. Run doctor.` }
+            : { ok: true, text: `Installed. Now running v${v.data.currentVersion}.` })
+          return
+        }
+        // Still staged after a restart means the apply declined, and the agent knows why.
+        if (v.data.stagedBlockedReason) {
+          setOutcome({ ok: false, text: v.data.stagedBlockedReason })
+          return
+        }
+      }
+      setOutcome({ ok: false, text: 'The agent did not come back within two minutes. Run doctor.' })
+    } finally {
+      setBusy(false)
+      onSettled()
+    }
+  }
+
+  return (
+    <PanelSection title="Update">
+      {staged && (
+        <PanelSectionRow>
+          <ReadOnlyRow>
+            <div style={{ fontSize: '0.85em' }}>
+              <b>v{staged}</b> is downloaded and verified.
+            </div>
+            <div style={{ opacity: 0.75, fontSize: '0.8em' }}>
+              {blocked ?? 'Installing takes a few seconds and restarts the agent. No game is affected.'}
+            </div>
+          </ReadOnlyRow>
+        </PanelSectionRow>
+      )}
+
+      {/* Blocked is shown instead of the button, not beside it. Restarting while a game is running
+          is harmless and does NOTHING — the agent defers the swap on purpose — and a button whose
+          success case is "nothing happened" is worse than no button. The 30 s status poll brings it
+          back on its own once the game closes. */}
+      {staged && !blocked && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={busy} onClick={() => void install()}>
+            {busy ? 'Installing…' : `Install v${staged} now`}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+
+      {outcome && (
+        <PanelSectionRow>
+          <ReadOnlyRow>
+            <span style={{ fontSize: '0.8em', opacity: outcome.ok ? 0.8 : 1 }}>{outcome.text}</span>
+          </ReadOnlyRow>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
+  )
+}
+
+/**
+ * systemctl's failure, in words a Deck owner can act on.
+ *
+ * The two that matter are named because they are not the same problem: no bus means this plugin's
+ * backend has no user session to talk to (and the agent is fine), while a missing unit means the
+ * agent was never installed through `install.sh`. Anything else is passed through verbatim rather
+ * than flattened into "it failed" — systemctl's own text is the only real diagnostic there is.
+ */
+function describeRestartFailure(reason: string): string {
+  if (reason === 'timeout') return 'The restart did not finish within two minutes. Run doctor.'
+  if (reason === 'exec-failed') return 'systemctl is not available on this device.'
+  if (reason.includes('connect to bus'))
+    return 'Could not reach this user\'s systemd. Restart your device to install the update.'
+  if (reason.includes('not found') || reason.includes('not loaded'))
+    return 'savelocker.service is not installed, so there is nothing to restart. '
+      + 'Restart your device, or run install.sh from Desktop mode.'
+  return `Could not restart the agent: ${reason}`
 }
 
 /**
@@ -572,6 +724,7 @@ function Content() {
     <>
     <LeaseWarnings warnings={state?.leaseWarnings ?? []} onDismiss={(g) => void dismiss(g)} />
     <Status state={state} version={version} />
+    <StagedUpdate version={version} onSettled={() => void refreshStatus()} />
     <PanelSection title="Launch options">
       <PanelSectionRow>
         <ToggleField

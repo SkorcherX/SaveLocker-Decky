@@ -69,6 +69,23 @@ def _request(path: str, payload=None):
         return {"ok": False, "reason": "bad-response"}
 
 
+def _user_systemd_env() -> dict:
+    """
+    The environment `systemctl --user` needs, which a plugin host does not supply.
+
+    Decky's backend is not a login shell, so it has no XDG_RUNTIME_DIR — and without one systemctl
+    cannot find the user manager's socket and fails with "Failed to connect to bus", which reads
+    like systemd being broken rather than an unset variable. The socket lives at a fixed path per
+    uid, so it can simply be named.
+
+    This is also why the plugin must stay non-`_root`: `savelocker.service` is a `systemd --user`
+    unit belonging to the desktop user, and root's systemd has never heard of it.
+    """
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    return env
+
+
 def _agent_binary() -> str | None:
     """
     The installed agent binary. Preferred over `~/.local/bin/savelocker` because that is a symlink
@@ -92,6 +109,51 @@ class Plugin:
     async def agent_version(self):
         """Current version, and whether the agent has a newer one waiting."""
         return _request("/api/agent-version")
+
+    async def restart_agent(self):
+        """
+        Restart `savelocker.service` — which is how an update the agent already staged gets
+        installed.
+
+        **Not `savelocker update`, deliberately.** That command re-checks the server, so it fails
+        when the Deck is offline even though a downloaded, verified payload is sitting on disk, and
+        it applies while the daemon is still live. The unit's own `ExecStartPre` performs the swap
+        in a fresh invocation with the old daemon already gone, which is the entire reason the
+        agent's design puts it there. Same outcome on a good day, better on every other.
+
+        Safe to call from here even though the restart kills the agent's whole cgroup: this process
+        belongs to Decky's cgroup, not to `savelocker.service`. The agent itself cannot do this to
+        itself for exactly that reason.
+
+        The caller must expect the agent's API to disappear for a few seconds afterwards — this
+        command is the thing that takes it away.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "--user", "restart", "savelocker.service",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=_user_systemd_env(),
+            )
+            # `restart` is synchronous: it returns once the unit is active, which means after
+            # ExecStartPre has finished the swap. Generous, because that swap copies the whole
+            # install.
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            output = stdout.decode("utf-8", "replace").strip()
+            if proc.returncode != 0:
+                decky.logger.warning("restart failed (%s): %s", proc.returncode, output)
+                # systemctl's own words, passed through: "Failed to connect to bus" and "Unit
+                # savelocker.service not found" are completely different problems with completely
+                # different fixes, and only it can tell them apart.
+                return {"ok": False, "reason": output or "exit-%d" % proc.returncode}
+            return {"ok": True, "data": None}
+        except asyncio.TimeoutError:
+            try: proc.kill()
+            except Exception: pass
+            return {"ok": False, "reason": "timeout"}
+        except OSError as err:
+            decky.logger.warning("could not run systemctl: %s", err)
+            return {"ok": False, "reason": "exec-failed"}
 
     async def dismiss_warning(self, game_name: str):
         """

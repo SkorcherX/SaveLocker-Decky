@@ -55,6 +55,20 @@ variables, or passing its own arguments keeps all of it — the wrapper is subst
 the most common setup mistake: Game Mode does not put `~/.local/bin` on `PATH`, so the short form
 silently stops the game launching.
 
+### Install update now
+
+When the agent has an update **downloaded and verified**, an **Update** section appears with an
+**Install update now** button. It restarts `savelocker.service`, which is what performs the swap, and
+waits for the agent to come back before telling you what version you are on.
+
+It appears only for an update that is already on the device — never for one the server has merely
+announced, which would need a download that can fail or hang. Without this the only routes are a
+reboot or a terminal, because "it installs the next time SaveLocker starts" means a systemd `--user`
+unit and nothing on a Deck says so.
+
+If a game is running, the button is replaced by the agent's own explanation: the swap is deliberately
+deferred while a game is open, so restarting then would succeed and change nothing.
+
 ## Why this exists as a plugin
 
 The agent **cannot** write launch options. They live in Steam's `localconfig.vdf` / `shortcuts.vdf`,
@@ -89,7 +103,10 @@ string from step 1 assumes a game with nothing set, and writing it blindly would
 - **No `_root` flag, and the backend is read-only against `~/.local/share/SaveLocker/`.** Everything
   it needs is the desktop user's own: the `api-token` is mode 0600 owned by that user and the agent's
   API is loopback. Root would buy nothing, and a root-created file in that directory breaks the agent
-  the next time it rewrites it.
+  the next time it rewrites it. It is also what makes the restart work at all — `savelocker.service`
+  is a `systemd --user` unit belonging to the desktop user, and root's systemd has never heard of it.
+  The backend does have to name `XDG_RUNTIME_DIR` explicitly, because a plugin host is not a login
+  shell and `systemctl --user` cannot find the manager's socket without it.
 
 ## Build
 
