@@ -69,6 +69,33 @@ def _request(path: str, payload=None):
         return {"ok": False, "reason": "bad-response"}
 
 
+def _clean_env() -> dict:
+    """
+    Our environment with Decky's own loader stripped back out of it.
+
+    Decky Loader ships as a PyInstaller one-file bundle, which unpacks its private copies of the
+    shared libraries it was built against into /tmp/_MEIxxxxxx and puts that directory on
+    LD_LIBRARY_PATH. Every process this backend spawns inherits it, and a SteamOS binary that then
+    loads a system library which needs a NEWER libcrypto than the bundle carries dies before it
+    runs a line:
+
+        systemctl: /tmp/_MEIFrnTgA/libcrypto.so.3: version `OPENSSL_3.4.0' not found
+                   (required by /usr/lib/systemd/libsystemd-shared-257.7-2.5.so)
+
+    That is a link failure with exit 1, not systemd's answer to anything, and it is what actually
+    broke "Install update now" on a Deck whose unit was present, enabled and running. PyInstaller
+    saves whatever was there before under LD_LIBRARY_PATH_ORIG, so the honest restore is to put
+    that back and drop ours otherwise.
+    """
+    env = dict(os.environ)
+    original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original:
+        env["LD_LIBRARY_PATH"] = original
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 def _user_systemd_env() -> dict:
     """
     The environment `systemctl --user` needs, which a plugin host does not supply.
@@ -81,7 +108,7 @@ def _user_systemd_env() -> dict:
     This is also why the plugin must stay non-`_root`: `savelocker.service` is a `systemd --user`
     unit belonging to the desktop user, and root's systemd has never heard of it.
     """
-    env = dict(os.environ)
+    env = _clean_env()
     env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
     return env
 
@@ -182,6 +209,7 @@ class Plugin:
                 binary, "doctor",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=_clean_env(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
             return {"ok": True, "data": {"exitCode": proc.returncode,
@@ -231,6 +259,7 @@ class Plugin:
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=_clean_env(),
             )
             # Generous: a push waits out the settle gate, and a big save over a slow link is slower
             # still. Better to wait than to orphan a sync half-done.

@@ -1,6 +1,6 @@
 {
   "name": "savelocker-decky",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Sets the Steam launch options SaveLocker needs, which the agent cannot set itself.",
   "type": "module",
   "scripts": {

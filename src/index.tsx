@@ -430,13 +430,19 @@ function StagedUpdate({ version, onSettled }: {
  * backend has no user session to talk to (and the agent is fine), while a missing unit means the
  * agent was never installed through `install.sh`. Anything else is passed through verbatim rather
  * than flattened into "it failed" — systemctl's own text is the only real diagnostic there is.
+ *
+ * The missing-unit test is anchored to the unit's own name, not to a bare "not found". A loose match
+ * told a Deck whose service was present, enabled and RUNNING that it had never been installed,
+ * because the dynamic linker had failed systemctl with `version 'OPENSSL_3.4.0' not found` — a
+ * sentence carrying those two words and meaning nothing like it. Advice this confident is earned.
  */
 function describeRestartFailure(reason: string): string {
   if (reason === 'timeout') return 'The restart did not finish within two minutes. Run doctor.'
   if (reason === 'exec-failed') return 'systemctl is not available on this device.'
   if (reason.includes('connect to bus'))
     return 'Could not reach this user\'s systemd. Restart your device to install the update.'
-  if (reason.includes('not found') || reason.includes('not loaded'))
+  if (reason.includes('savelocker.service not found') ||
+      reason.includes('savelocker.service not loaded'))
     return 'savelocker.service is not installed, so there is nothing to restart. '
       + 'Restart your device, or run install.sh from Desktop mode.'
   return `Could not restart the agent: ${reason}`
