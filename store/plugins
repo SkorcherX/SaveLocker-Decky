@@ -7,7 +7,7 @@
     "tags": ["saves", "sync", "utility"],
     "image_url": "https://opengraph.githubassets.com/1/SkorcherX/SaveLocker-Decky",
     "versions": [
-      { "name": "0.2.1", "hash": "c25091112aa4ad2b5afe65f03bc8f327c619ae2b2f73effafe7dd1454e0a9e53", "artifact": "https://github.com/SkorcherX/SaveLocker-Decky/releases/download/v0.2.1/SaveLocker.zip" }
+      { "name": "0.2.2", "hash": "9f4e4a06e6c244c1bc6737bb2b0420582ccb1098b9cf4537fc1af8cd8f29390d", "artifact": "https://github.com/SkorcherX/SaveLocker-Decky/releases/download/v0.2.2/SaveLocker.zip" }
     ]
   }
 ]
